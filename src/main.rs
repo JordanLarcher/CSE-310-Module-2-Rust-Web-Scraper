@@ -1,18 +1,22 @@
 use clap::{Parser, ValueEnum};
-use reqwest::blocking::get;
+use reqwest::header::{HeaderMap, USER_AGENT};
 use rusqlite::{params, Connection};
 use scraper::{Html, Selector};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use url::Url;
 use std::error::Error;
 use std::fs::File;
-use std::io::{Read, Write};
-use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ScrapedData {
-    title: String,
+
+// 1. A Generic Data Structure
+#[derive(Debug, Serialize)]
+struct ScrapedItem {
+    #[serde(rename = "Source URL")]
+    source_url: String,
+    #[serde(rename = "Tag Content")]
     content: String,
-    link: String,
+    #[serde(rename = "Attribute Value")]
+    attribute_value: Option<String>,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -23,185 +27,149 @@ enum OutputFormat {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "A basic web scraper in Rust", long_about = None)]
+#[command(author, version, about = "A Generic Web Scraper", long_about = None)]
 struct Args {
-    /// URL to scrape
+    /// The full URL of the website to scrape
     #[arg(short, long)]
     url: String,
 
-    /// CSS selector for elements to scrape (e.g., "h2", "a", "div.article")
+    /// CSS selector for elements (e.g., "h1", ".product-title", "a")
     #[arg(short, long)]
     selector: String,
+
+    /// Optional: Specific attribute to extract (e.g., "href", "src")
+    #[arg(short, long)]
+    attribute: Option<String>,
 
     /// Output format
     #[arg(short = 'f', long, value_enum, default_value = "json")]
     format: OutputFormat,
 
-    /// Output file name (without extension)
-    #[arg(short, long, default_value = "output")]
+    /// Output file name
+    #[arg(short, long, default_value = "scraped_data")]
     output: String,
-
-    /// Filter results by keyword (case-insensitive)
-    #[arg(short = 'k', long)]
-    keyword: Option<String>,
-
-    /// Limit number of results
-    #[arg(short, long)]
-    limit: Option<usize>,
 }
 
-fn scrape_website(url: &str, selector_str: &str) -> Result<Vec<ScrapedData>, Box<dyn Error>> {
-    println!("Fetching: {}", url);
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
     
-    let body = if url.starts_with("http://") || url.starts_with("https://") {
-        // Fetch from URL
-        let response = get(url)?;
-        response.text()?
-    } else if Path::new(url).exists() {
-        // Read from local file
-        println!("Reading local file...");
-        let mut file = File::open(url)?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
-        contents
-    } else {
-        return Err(format!("Invalid URL or file path: {}", url).into());
-    };
+    // Validate the URL
+    let target_url = Url::parse(&args.url).map_err(|_| "Invalid URL provided")?;
+
+    println!("Scraping: {}", target_url);
+    println!("Selector: {}", args.selector);
+
+    // 2. Fetch
+    let html_content = fetch_html(target_url.as_str()).await?;
     
-    let document = Html::parse_document(&body);
-    let selector = Selector::parse(selector_str)
-        .map_err(|e| format!("Invalid CSS selector: {:?}", e))?;
+    // 3. Generic Extraction
+    let results = extract_generic(&html_content, &args.selector, args.attribute.as_deref(), target_url.as_str());
+
+    if results.is_empty() {
+        println!("No elements found matching that selector.");
+        return Ok(());
+    }
+
+    println!("Found {} items.", results.len());
+
+    // 4. Export
+    match args.format {
+        OutputFormat::Csv => export_to_csv(&results, &args.output)?,
+        OutputFormat::Json => export_to_json(&results, &args.output)?,
+        OutputFormat::Sqlite => export_to_sqlite(&results, &args.output)?,
+    }
+
+    Ok(())
+}
+
+/// Fetches the HTML from any URL
+pub async fn fetch_html(url: &str) -> Result<String, reqwest::Error> {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36".parse().unwrap());
+    headers.insert("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8".parse().unwrap());
+
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let response = client.get(url).send().await?.error_for_status()?;
+    let final_url = response.url().to_string();
+    println!("Final URL after redirects: {}", final_url);
+    response.text().await
+}
+
+/// Performs generic extraction based on user-provided CSS selectors
+fn extract_generic(html: &str, selector_str: &str, attr_name: Option<&str>, source: &str) -> Vec<ScrapedItem> {
+    let document = Html::parse_document(html);
     
-    let mut data = Vec::new();
-    
-    for element in document.select(&selector) {
-        let title = element
-            .text()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .trim()
-            .to_string();
-        
-        let link = element
-            .value()
-            .attr("href")
-            .unwrap_or("")
-            .to_string();
-        
-        let content = element.inner_html();
-        
-        if !title.is_empty() {
-            data.push(ScrapedData {
-                title,
-                content,
-                link,
-            });
+    // Attempt to parse the user's CSS selector
+    let selector = match Selector::parse(selector_str) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("Error: Invalid CSS selector '{}'", selector_str);
+            return vec![];
         }
-    }
-    
-    println!("Scraped {} elements", data.len());
-    Ok(data)
+    };
+
+    document.select(&selector)
+        .map(|element| {
+            let content = element.text().collect::<Vec<_>>().join(" ").trim().to_string();
+            
+            // If the user asked for an attribute (like href), get it
+            let attribute_value = attr_name.and_then(|a| element.value().attr(a).map(|v| v.to_string()));
+
+            ScrapedItem {
+                source_url: source.to_string(),
+                content,
+                attribute_value,
+            }
+        })
+        .filter(|item| !item.content.is_empty() || item.attribute_value.is_some())
+        .collect()
 }
 
-fn filter_data(data: Vec<ScrapedData>, keyword: Option<String>, limit: Option<usize>) -> Vec<ScrapedData> {
-    let mut filtered = data;
-    
-    if let Some(kw) = keyword {
-        let kw_lower = kw.to_lowercase();
-        filtered.retain(|item| {
-            item.title.to_lowercase().contains(&kw_lower)
-                || item.content.to_lowercase().contains(&kw_lower)
-        });
-        println!("Filtered to {} elements matching keyword '{}'", filtered.len(), kw);
-    }
-    
-    if let Some(limit_val) = limit {
-        filtered.truncate(limit_val);
-        println!("Limited to {} elements", filtered.len());
-    }
-    
-    filtered
-}
+// --- Generic Export Logic ---
 
-fn export_to_csv(data: &[ScrapedData], filename: &str) -> Result<(), Box<dyn Error>> {
+fn export_to_csv(data: &[ScrapedItem], filename: &str) -> Result<(), Box<dyn Error>> {
     let path = format!("{}.csv", filename);
     let mut writer = csv::Writer::from_path(&path)?;
-    
-    writer.write_record(&["Title", "Content", "Link"])?;
-    
     for item in data {
-        writer.write_record(&[&item.title, &item.content, &item.link])?;
+        writer.serialize(item)?;
     }
-    
     writer.flush()?;
-    println!("Data exported to {}", path);
+    println!("Saved to {}", path);
     Ok(())
 }
 
-fn export_to_json(data: &[ScrapedData], filename: &str) -> Result<(), Box<dyn Error>> {
+fn export_to_json(data: &[ScrapedItem], filename: &str) -> Result<(), Box<dyn Error>> {
     let path = format!("{}.json", filename);
-    let json = serde_json::to_string_pretty(&data)?;
-    
-    let mut file = File::create(&path)?;
-    file.write_all(json.as_bytes())?;
-    
-    println!("Data exported to {}", path);
+    let file = File::create(&path)?;
+    serde_json::to_writer_pretty(file, data)?;
+    println!("Saved to {}", path);
     Ok(())
 }
 
-fn export_to_sqlite(data: &[ScrapedData], filename: &str) -> Result<(), Box<dyn Error>> {
+fn export_to_sqlite(data: &[ScrapedItem], filename: &str) -> Result<(), Box<dyn Error>> {
     let path = format!("{}.db", filename);
-    let conn = Connection::open(&path)?;
-    
+    let conn = Connection::open(path)?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS scraped_data (
+        "CREATE TABLE IF NOT EXISTS scraped_items (
             id INTEGER PRIMARY KEY,
-            title TEXT NOT NULL,
-            content TEXT NOT NULL,
-            link TEXT
+            source TEXT,
+            content TEXT,
+            attribute TEXT
         )",
         [],
     )?;
-    
+
     for item in data {
         conn.execute(
-            "INSERT INTO scraped_data (title, content, link) VALUES (?1, ?2, ?3)",
-            params![item.title, item.content, item.link],
+            "INSERT INTO scraped_items (source, content, attribute) VALUES (?1, ?2, ?3)",
+            params![item.source_url, item.content, item.attribute_value],
         )?;
     }
-    
-    println!("Data exported to SQLite database: {}", path);
-    Ok(())
-}
-
-fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
-    
-    println!("Web Scraper Started");
-    println!("==================");
-    
-    let scraped_data = scrape_website(&args.url, &args.selector)?;
-    
-    if scraped_data.is_empty() {
-        println!("No data found with the provided selector.");
-        return Ok(());
-    }
-    
-    let filtered_data = filter_data(scraped_data, args.keyword, args.limit);
-    
-    if filtered_data.is_empty() {
-        println!("No data remaining after filtering.");
-        return Ok(());
-    }
-    
-    match args.format {
-        OutputFormat::Csv => export_to_csv(&filtered_data, &args.output)?,
-        OutputFormat::Json => export_to_json(&filtered_data, &args.output)?,
-        OutputFormat::Sqlite => export_to_sqlite(&filtered_data, &args.output)?,
-    }
-    
-    println!("==================");
-    println!("Scraping completed successfully!");
-    
     Ok(())
 }
